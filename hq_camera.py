@@ -2,13 +2,12 @@
 """
 hq_camera.py
 
-Picamera2 preview with small circular capture button overlay + live ISO / shutter / WB readout.
+Preview + full-resolution capture button for Raspberry Pi Picamera2.
 
-This version adds:
- - --debug-touch : print verbose touch mapping / button geometry info
- - --invert-x / --invert-y / --swap-axes : simple transforms to fix mapping
- - preserves all previous behavior (DRM preview, overlay, capture)
+This patch adds a --jpeg-quality option and sets picam2.options['quality'] accordingly
+so JPEG encoder uses higher quality (less compression -> larger file sizes).
 """
+
 from pathlib import Path
 from datetime import datetime
 import argparse
@@ -47,7 +46,6 @@ TEXT_COLOR = (255, 255, 255, 230)   # white, slightly translucent
 TEXT_BG_COLOR = (0, 0, 0, 110)      # translucent black behind text for readability
 TEXT_MARGIN = 8                      # px padding around text
 
-# try to load a nicer truetype font if available; fallback to PIL default
 def _load_font(size):
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -61,7 +59,6 @@ def _load_font(size):
             continue
     return ImageFont.load_default()
 
-# Pillow text measurement helper
 def _text_size(draw, text, font):
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
@@ -77,7 +74,7 @@ def _text_size(draw, text, font):
             except Exception:
                 return (0, 0)
 
-# ---- Utility formatting ----
+# Formatting helpers
 def format_shutter(exposure_us):
     if not exposure_us:
         return "—"
@@ -120,7 +117,7 @@ def format_wb(metadata):
         return str(awb)
     return "—"
 
-# ---- Touch helpers ----
+# Touch helpers (same as before)
 def find_touchscreen_device():
     if not EVDEV_AVAILABLE:
         return None
@@ -146,20 +143,9 @@ def get_abs_range(dev):
     return {"x_min": 0, "x_max": 32767, "y_min": 0, "y_max": 32767}
 
 def touch_listener(dev, mapping, action_callback, stop_event):
-    """
-    Robust touch listener with runtime calibration.
-
-    - mapping initially contains x_min,x_max,y_min,y_max (from get_abs_range())
-    - This listener builds observed_min/observed_max from incoming ABS events
-      and uses those ranges for mapping when they look reasonable.
-    - Supports mapping flags from mapping: debug, invert_x, invert_y, swap_axes.
-    """
     last_x = None
     last_y = None
 
-    # Decide whether to initialize observed ranges from mapping or start empty.
-    # If mapping looks like the generic fallback (0..32767), start observed as None
-    # so first real events set a proper observed range.
     def looks_like_default_range(vmin, vmax):
         return vmin == 0 and vmax == 32767
 
@@ -202,7 +188,6 @@ def touch_listener(dev, mapping, action_callback, stop_event):
                 elif ev.code in (ecodes.ABS_MT_POSITION_Y, ecodes.ABS_Y):
                     last_y = ev.value
 
-                # update observed min/max as values arrive
                 update_observed(last_x, last_y)
 
                 if mapping.get("debug"):
@@ -216,7 +201,6 @@ def touch_listener(dev, mapping, action_callback, stop_event):
                 if ev.value == 1 and last_x is not None and last_y is not None:
                     w, h = mapping['preview_size']
 
-                    # pick ranges (prefer observed if we have them and they're sane)
                     use_x_min, use_x_max = obs_x_min, obs_x_max
                     use_y_min, use_y_max = obs_y_min, obs_y_max
 
@@ -245,7 +229,6 @@ def touch_listener(dev, mapping, action_callback, stop_event):
                     x_px = int((last_x - use_x_min) / float(use_x_max - use_x_min) * (w - 1))
                     y_px = int((last_y - use_y_min) / float(use_y_max - use_y_min) * (h - 1))
 
-                    # optional transforms
                     if mapping.get("swap_axes"):
                         x_px, y_px = y_px, x_px
                     if mapping.get("invert_x"):
@@ -253,7 +236,6 @@ def touch_listener(dev, mapping, action_callback, stop_event):
                     if mapping.get("invert_y"):
                         y_px = (h - 1) - y_px
 
-                    # clamp
                     x_px = max(0, min(w - 1, x_px))
                     y_px = max(0, min(h - 1, y_px))
 
@@ -270,9 +252,7 @@ def touch_listener(dev, mapping, action_callback, stop_event):
     except Exception as e:
         print("Touch listener exited:", e)
 
-
-
-# ---- Overlay composition ----
+# Overlay composition (unchanged)
 def compose_overlay_array(preview_size, text_lines, pressed=False):
     width, height = preview_size
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -290,26 +270,21 @@ def compose_overlay_array(preview_size, text_lines, pressed=False):
     block_w = max_w + 2 * TEXT_MARGIN
     block_h = sum(line_heights) + 2 * TEXT_MARGIN + (len(line_heights)-1) * 2
 
-    # text background
     draw.rectangle((TEXT_MARGIN, TEXT_MARGIN, TEXT_MARGIN + block_w, TEXT_MARGIN + block_h),
                    fill=TEXT_BG_COLOR)
 
-    # draw text
     y = TEXT_MARGIN + TEXT_MARGIN // 2
     for i, line in enumerate(text_lines):
         draw.text((TEXT_MARGIN + 4, y), line, font=font, fill=TEXT_COLOR)
         y += line_heights[i] + 2
 
-    # button geometry
     r = int(min(width, height) * BUTTON_RADIUS_RATIO)
     margin = int(width * BUTTON_MARGIN_RATIO)
     cx = width - margin - r
     cy = height - margin - r
 
-    # shadow and circle
     shadow_offset = max(2, r // 8)
-    shadow_bbox = (cx - r + shadow_offset, cy - r + shadow_offset,
-                   cx + r + shadow_offset, cy + r + shadow_offset)
+    shadow_bbox = (cx - r + shadow_offset, cy - r + shadow_offset, cx + r + shadow_offset, cy + r + shadow_offset)
     draw.ellipse(shadow_bbox, fill=(0, 0, 0, 90))
 
     fill = BUTTON_PRESSED_COLOR if pressed else BUTTON_COLOR
@@ -317,34 +292,101 @@ def compose_overlay_array(preview_size, text_lines, pressed=False):
     draw.ellipse(bbox, fill=fill, outline=(0, 0, 0, 140), width=BUTTON_STROKE)
 
     inner_r = max(2, r // 3)
-    draw.ellipse((cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r),
-                 fill=(0, 0, 0, 60))
+    draw.ellipse((cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r), fill=(0, 0, 0, 60))
 
     return np.array(img, dtype=np.uint8), (cx, cy, r)
 
-# ---- Main camera class ----
+# Main camera class
 class HQCameraWithButton:
     def __init__(self, preview_size=(640, 480), outdir="captures", touchscreen_device_path=None,
-                 debug_touch=False, invert_x=False, invert_y=False, swap_axes=False):
+                 debug_touch=False, invert_x=False, invert_y=False, swap_axes=False,
+                 buffer_count=6, request_raw=True, still_size=None, jpeg_quality=95):
         self.preview_size = preview_size
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
 
         self.picam2 = Picamera2()
-        cfg = self.picam2.create_preview_configuration({"size": preview_size})
-        self.picam2.configure(cfg)
 
+        # --- NEW: set JPEG quality via picam2.options ---
+        # picamera2 exposes a global 'options' mapping where 'quality' sets the JPEG encoder quality.
+        # Higher -> less compression -> larger files. Typical acceptable range: 80..95. 95 is near-max.
+        try:
+            if isinstance(jpeg_quality, int) and 1 <= jpeg_quality <= 100:
+                # clamp at 95 if underlying stack doesn't support >95; many stacks use 0..95 as max-quality.
+                q = int(jpeg_quality)
+                if q > 95:
+                    q = 95
+                self.picam2.options['quality'] = q
+            else:
+                # default fallback
+                self.picam2.options['quality'] = 95
+        except Exception:
+            # Some picamera2 builds might not expose options; ignore failure and continue.
+            pass
+
+        # (rest of __init__ builds combined configuration like before)
+        try:
+            sensor_res = self.picam2.sensor_resolution
+        except Exception:
+            sensor_res = None
+
+        self.preview_config = None
+        self.still_config = None
+
+        try:
+            if still_size:
+                target_main_size = still_size
+            else:
+                target_main_size = sensor_res
+
+            cfg_kwargs = {
+                "main": {"size": target_main_size, "format": "RGB888"},
+                "lores": {"size": preview_size, "format": "YUV420"},
+                "display": "lores",
+                "buffer_count": max(2, int(buffer_count))
+            }
+            if request_raw and sensor_res:
+                cfg_kwargs["raw"] = {"size": sensor_res}
+
+            combined_cfg = self.picam2.create_still_configuration(**cfg_kwargs)
+            self.still_config = combined_cfg
+            self.preview_config = combined_cfg
+            if debug_touch:
+                print("DEBUG: Combined configuration created:", {"main": cfg_kwargs["main"]["size"], "lores": cfg_kwargs["lores"]["size"], "raw": cfg_kwargs.get("raw")})
+        except Exception as e:
+            if debug_touch:
+                print("DEBUG: Combined configuration failed:", e)
+                print("DEBUG: Trying fallback create_still_configuration() (no kwargs).")
+            try:
+                fallback_still = self.picam2.create_still_configuration()
+                preview_cfg = self.picam2.create_preview_configuration({"size": preview_size})
+                self.preview_config = preview_cfg
+                self.still_config = fallback_still
+                self.picam2.configure(preview_cfg)
+                if debug_touch:
+                    print("DEBUG: Fallback configured preview (will use mode-switching for still captures).")
+            except Exception as e2:
+                print("Failed to create camera configuration:", e2)
+                raise
+
+        if self.preview_config is not None:
+            try:
+                self.picam2.configure(self.preview_config)
+            except Exception as e:
+                print("Failed to configure Picamera2 with preview_config:", e)
+                raise
+
+        # overlay / UI state
         self.overlay_lock = threading.Lock()
-        self.button_geom = (0, 0, 0)   # will be updated when overlay is composed
+        self.button_geom = (0, 0, 0)
         self.overlay_pressed = False
 
-        # store transform/debug flags
         self.debug_touch = debug_touch
         self.invert_x = invert_x
         self.invert_y = invert_y
         self.swap_axes = swap_axes
 
-        # touch
+        # touch initialization (unchanged)
         self.touch_dev = None
         self.touch_mapping = None
         if touchscreen_device_path:
@@ -365,14 +407,12 @@ class HQCameraWithButton:
 
         if self.touch_dev:
             abs_range = get_abs_range(self.touch_dev)
-            # try to override axis ranges from a saved calibration file (~/.camera_touch_calib.json)
             import json, os
             calib_path = os.path.expanduser("~/.camera_touch_calib.json")
             if os.path.exists(calib_path):
                 try:
                     with open(calib_path, "r") as f:
                         c = json.load(f)
-                    # only use valid ints if present
                     if all(k in c for k in ("x_min","x_max","y_min","y_max")):
                         abs_range['x_min'] = int(c['x_min'])
                         abs_range['x_max'] = int(c['x_max'])
@@ -382,7 +422,6 @@ class HQCameraWithButton:
                 except Exception as ex:
                     print("Failed to load calibration file:", ex)
             abs_range['preview_size'] = preview_size
-            # add transform/debug flags into mapping so touch_listener can read them
             abs_range['debug'] = self.debug_touch
             abs_range['invert_x'] = self.invert_x
             abs_range['invert_y'] = self.invert_y
@@ -403,6 +442,14 @@ class HQCameraWithButton:
         self._last_metadata = {}
 
     def start(self):
+        # print effective quality setting so you can verify it on startup
+        try:
+            q = self.picam2.options.get('quality', None)
+            if q is not None:
+                print(f"JPEG encoder quality set to: {q}")
+        except Exception:
+            pass
+
         try:
             self.picam2.start_preview(Preview.DRM, x=0, y=0,
                                       width=self.preview_size[0], height=self.preview_size[1])
@@ -424,16 +471,13 @@ class HQCameraWithButton:
             except Exception:
                 pass
 
-        # update mapping's button_geom if we already set touch_mapping
         if self.touch_mapping is not None:
             self.touch_mapping['button_geom'] = self.button_geom
 
         self.metadata_thread = threading.Thread(target=self._metadata_updater, daemon=True)
         self.metadata_thread.start()
 
-        # touch listener
         if self.touch_dev and EVDEV_AVAILABLE:
-            # ensure mapping uses latest button geom each time by reference
             self.touch_mapping['button_geom'] = self.button_geom
             self.touch_thread = threading.Thread(target=touch_listener,
                                                  args=(self.touch_dev, self.touch_mapping, self._on_touch, self.stop_event),
@@ -495,7 +539,6 @@ class HQCameraWithButton:
             with self.overlay_lock:
                 arr, geom = compose_overlay_array(self.preview_size, lines, pressed=self.overlay_pressed)
                 self.button_geom = geom
-                # keep mapping updated for debug thread
                 if self.touch_mapping is not None:
                     self.touch_mapping['button_geom'] = self.button_geom
                 try:
@@ -506,13 +549,10 @@ class HQCameraWithButton:
             time.sleep(0.12)
 
     def _on_touch(self, x_px, y_px):
-        # called with touch coords mapped to preview pixels
         cx, cy, r = self.button_geom
-        # allow extra touch padding
         pad = globals().get("BUTTON_TOUCH_PADDING_PX", 0)
         dx = x_px - cx
         dy = y_px - cy
-        # compare squared distance to squared (r + pad)
         rp = r + pad
         inside = (dx * dx + dy * dy) <= (rp * rp)
         if self.debug_touch:
@@ -524,7 +564,6 @@ class HQCameraWithButton:
         else:
             if self.debug_touch:
                 print("DEBUG: TOUCH outside button")
-
 
     def _keyboard_listener(self):
         while not self.stop_event.is_set():
@@ -541,10 +580,19 @@ class HQCameraWithButton:
         def do_capture():
             fname = self._timestamped_filename()
             try:
-                self.picam2.capture_file(fname)
+                if hasattr(self.picam2, "switch_mode_and_capture_file") and self.still_config is not None and self.preview_config is not None and self.still_config is not self.preview_config:
+                    if self.debug_touch:
+                        print("DEBUG: Using switch_mode_and_capture_file for capture:", fname)
+                    self.picam2.switch_mode_and_capture_file(self.still_config, fname)
+                else:
+                    if self.debug_touch:
+                        print("DEBUG: Using capture_file (combined config expected) ->", fname)
+                    self.picam2.capture_file(fname)
+
                 print("Captured:", fname)
             except Exception as e:
                 print("Capture failed:", e)
+
             time.sleep(FLASH_MS / 1000.0)
             with self.overlay_lock:
                 self.overlay_pressed = False
@@ -583,28 +631,42 @@ class HQCameraWithButton:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         return str(self.outdir / f"{ts}.jpg")
 
-# ---- CLI ----
+# CLI
 def parse_preview_size(s):
     if "x" in s:
         w, h = s.split("x", 1)
         return (int(w), int(h))
     raise argparse.ArgumentTypeError("Preview size must be WIDTHxHEIGHT, e.g. 640x480")
 
+def parse_still_size(s):
+    if not s:
+        return None
+    if "x" in s:
+        w, h = s.split("x", 1)
+        return (int(w), int(h))
+    raise argparse.ArgumentTypeError("Still size must be WIDTHxHEIGHT, e.g. 4056x3040")
+
 def main():
-    parser = argparse.ArgumentParser(description="HQ camera preview with capture button + metadata overlay (DRM)")
+    parser = argparse.ArgumentParser(description="HQ camera preview with capture button + metadata overlay (combined lores + main streams)")
     parser.add_argument("--preview-size", type=parse_preview_size, default=f"{DEFAULT_PREVIEW_SIZE[0]}x{DEFAULT_PREVIEW_SIZE[1]}",
                         help="Preview size WIDTHxHEIGHT (default: 640x480)")
-    parser.add_argument("--outdir", type=str, default="captures", help="Directory to save captures")
-    parser.add_argument("--touch-device", type=str, default=None, help="evdev touchscreen device path (optional)")
+    parser.add_argument("--outdir", type=str, default="/media/DCIM", help="Directory to save captures")
+    parser.add_argument("--touch-device", type=str, default="/dev/input/event7", help="evdev touchscreen device path (optional)")
     parser.add_argument("--debug-touch", action="store_true", help="Enable touch debug logging")
     parser.add_argument("--invert-x", action="store_true", help="Invert mapped touch X coordinate")
     parser.add_argument("--invert-y", action="store_true", help="Invert mapped touch Y coordinate")
     parser.add_argument("--swap-axes", action="store_true", help="Swap X and Y axes (for rotated screens)")
+    parser.add_argument("--buffer-count", type=int, default=6, help="Buffer count for camera pipeline (reduce if allocation fails)")
+    parser.add_argument("--no-raw", action="store_true", help="Do not request full-res raw stream (saves memory)")
+    parser.add_argument("--still-size", type=parse_still_size, default=None, help="Force still/main size WIDTHxHEIGHT (optional)")
+    parser.add_argument("--jpeg-quality", type=int, default=100, help="JPEG encoder quality (1-100). Will be clamped to 95 max in practice.")
     args = parser.parse_args()
 
     preview_size = args.preview_size if isinstance(args.preview_size, tuple) else parse_preview_size(args.preview_size)
     cam = HQCameraWithButton(preview_size=preview_size, outdir=args.outdir, touchscreen_device_path=args.touch_device,
-                             debug_touch=args.debug_touch, invert_x=args.invert_x, invert_y=args.invert_y, swap_axes=args.swap_axes)
+                             debug_touch=args.debug_touch, invert_x=args.invert_x, invert_y=args.invert_y, swap_axes=args.swap_axes,
+                             buffer_count=args.buffer_count, request_raw=(not args.no_raw), still_size=args.still_size,
+                             jpeg_quality=args.jpeg_quality)
     cam.start()
 
 if __name__ == "__main__":
